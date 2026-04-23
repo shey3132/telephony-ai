@@ -36,10 +36,22 @@ def upload():
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
+    # בודקים אם המאזין כבר אמר משהו
     user_text = request.values.get('v', '')
-    if not user_text: return "read=t-איך אפשר לעזור?="
-    response = model.generate_content(user_text)
-    return f"read=t-{response.text}="
+    
+    # אם המשתמש עדיין לא אמר כלום (כניסה ראשונה לשלוחה)
+    if not user_text:
+        # פקודה למערכת הטלפונית: להשמיע הודעה ולפתוח מיקרופון לזיהוי דיבור
+        return "read=t-שלום, אני מקשיב, מה השאלה שלך?=&api_add_listening=yes"
+
+    # אם כבר יש טקסט מהמאזין, נשלח אותו ל-AI
+    try:
+        response = model.generate_content(user_text)
+        ai_text = response.text
+        # מחזירים את התשובה ופותחים שוב את המיקרופון לשאלה הבאה
+        return f"read=t-{ai_text}=&api_add_listening=yes"
+    except Exception as e:
+        return "read=t-חלה שגיאה בעיבוד הנתונים, נסו שוב.=&api_add_listening=yes"
 
 @app.route('/')
 def home():
