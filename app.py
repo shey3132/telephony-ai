@@ -1,30 +1,45 @@
 from flask import Flask, request
 import google.generativeai as genai
 import os
+import requests
 
 app = Flask(__name__)
 
-# הגדרת ה-AI (המפתח יגיע מהגדרות השרת)
+# הגדרת ה-AI
 genai.configure(api_key=os.environ.get("GEMINI_KEY"))
 model = genai.GenerativeModel('gemini-pro')
 
-@app.route('/chat', methods=['GET', 'POST'])
-def chat():
-    # קבלת הטקסט מהמערכת הטלפונית
-    user_text = request.values.get('v', '')
+@app.route('/upload', methods=['POST', 'GET'])
+def upload():
+    # המערכת הטלפונית שולחת קישור לקובץ ההקלטה בפרמטר 'url'
+    audio_url = request.values.get('url')
     
-    if not user_text:
-        return "read=t-שלום, במה אני יכול לעזור?="
+    if not audio_url:
+        return "read=t-לא התקבלה הקלטה.="
 
     try:
-        # שליחת השאלה ל-AI
-        response = model.generate_content(user_text)
-        ai_text = response.text
+        # כאן אנחנו צריכים להפוך קול לטקסט. 
+        # בגלל שזה שרת חינמי, הדרך הכי פשוטה היא שהמערכת הטלפונית
+        # תעשה את ה-STT. אם המערכת שלך ממש לא מסוגלת,
+        # אנחנו נשתמש ב-API של Gemini שיודע לקבל גם קבצי שמע.
         
-        # החזרת התשובה לטלפון (בפורמט הקראה)
-        return f"read=t-{ai_text}="
+        # לצורך הבדיקה הראשונה של הקלטה, נניח שהמערכת שולחת טקסט ב-v
+        # אם אתה רוצה שהשרת ינתח קובץ שמע ממש, נצטרך להוסיף ספרית עיבוד קול.
+        
+        user_text = request.values.get('v', 'הודעה קולית התקבלה') 
+        
+        response = model.generate_content(user_text)
+        return f"read=t-{response.text}="
+        
     except Exception as e:
-        return "read=t-מצטער, יש לי תקלה קטנה במוח.="
+        return f"read=t-שגיאה בעיבוד הקול: {str(e)}="
+
+@app.route('/chat', methods=['GET', 'POST'])
+def chat():
+    user_text = request.values.get('v', '')
+    if not user_text: return "read=t-איך אפשר לעזור?="
+    response = model.generate_content(user_text)
+    return f"read=t-{response.text}="
 
 @app.route('/')
 def home():
