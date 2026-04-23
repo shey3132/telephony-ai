@@ -7,56 +7,44 @@ app = Flask(__name__)
 
 # הגדרת ה-AI
 genai.configure(api_key=os.environ.get("GEMINI_KEY"))
-model = genai.GenerativeModel('gemini-pro')
-
-@app.route('/upload', methods=['POST', 'GET'])
-def upload():
-    # המערכת הטלפונית שולחת קישור לקובץ ההקלטה בפרמטר 'url'
-    audio_url = request.values.get('url')
-    
-    if not audio_url:
-        return "read=t-לא התקבלה הקלטה.="
-
-    try:
-        # כאן אנחנו צריכים להפוך קול לטקסט. 
-        # בגלל שזה שרת חינמי, הדרך הכי פשוטה היא שהמערכת הטלפונית
-        # תעשה את ה-STT. אם המערכת שלך ממש לא מסוגלת,
-        # אנחנו נשתמש ב-API של Gemini שיודע לקבל גם קבצי שמע.
-        
-        # לצורך הבדיקה הראשונה של הקלטה, נניח שהמערכת שולחת טקסט ב-v
-        # אם אתה רוצה שהשרת ינתח קובץ שמע ממש, נצטרך להוסיף ספרית עיבוד קול.
-        
-        user_text = request.values.get('v', 'הודעה קולית התקבלה') 
-        
-        response = model.generate_content(user_text)
-        return f"read=t-{response.text}="
-        
-    except Exception as e:
-        return f"read=t-שגיאה בעיבוד הקול: {str(e)}="
+model = genai.GenerativeModel('gemini-1.5-flash') # גרסה שתומכת בקבצי שמע
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
-    # התעלמות מהודעות ניתוק
     if request.values.get('hangup') == 'yes':
         return "OK"
 
-    user_text = request.values.get('v', '')
+    # קבלת הנתיב המלא של קובץ ההקלטה מהמערכת הטלפונית
+    audio_path = request.values.get('audio_file')
     
-    # שלב א: כניסה ראשונה - מבקשים מהמשתמש לדבר
-    if not user_text:
-        # משתמשים ב-read כדי לפתוח מיקרופון (stt) ולשמור את התוצאה בפרמטר v
-        return "read=t-שלום, אני מקשיב, מה השאלה שלך?=v,stt,he-IL,no,yes"
+    # אם אין קובץ שמע (כניסה ראשונה לשלוחה)
+    if not audio_path:
+        # פקודת הקלטה: השמעת הודעה והקלטה לפרמטר audio_file
+        return "read=t-נא לומר את השאלה לאחר הצליל ולסיום להקיש סולמית=audio_file,yes,record,/,audio_file,no,yes,yes"
 
-    # שלב ב: יש לנו טקסט מהמשתמש, שולחים ל-AI
     try:
-        response = model.generate_content(user_text)
-        ai_text = response.text.replace('"', '').replace("'", "").replace("=", "")
+        # 1. הורדת קובץ השמע מהמערכת הטלפונית
+        # (הכתובת המלאה נבנית מהנתיב שהתקבל)
+        audio_url = f"https://call2all.co.il/ym/api/DownloadFile?path={audio_path}"
+        audio_data = requests.get(audio_url).content
         
-        # מחזירים את תשובת ה-AI ושוב פותחים מיקרופון לשאלה הבאה
-        return f"id_list_message=t-{ai_text}&read=t-האם יש עוד שאלה?=v,stt,he-IL,no,yes"
+        # 2. שליחת הקובץ ל-Gemini לתמלול ומענה
+        # אנחנו יוצרים "חלק" של קובץ שמע עבור ה-AI
+        audio_part = {
+            "mime_type": "audio/wav",
+            "data": audio_data
+        }
         
+        prompt = "תמלל את ההקלטה וענה עליה בקצרה בעברית."
+        response = model.generate_content([prompt, audio_part])
+        ai_text = response.text.replace('"', '').replace("=", "")
+        
+        # 3. החזרת התשובה ופתיחת הקלטה חדשה
+        return f"id_list_message=t-{ai_text}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
+
     except Exception as e:
-        return "id_list_message=t-חלה שגיאה בחיבור למוח הדיגיטלי&read=t-נסה לומר שוב?=v,stt,he-IL,no,yes"
+        print(f"Error: {e}")
+        return "id_list_message=t-חלה שגיאה בעיבוד השמע&go_to_folder=."
 
 @app.route('/')
 def home():
