@@ -36,22 +36,27 @@ def upload():
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
-    # בודקים אם המאזין כבר אמר משהו
+    # התעלמות מהודעות ניתוק
+    if request.values.get('hangup') == 'yes':
+        return "OK"
+
     user_text = request.values.get('v', '')
     
-    # אם המשתמש עדיין לא אמר כלום (כניסה ראשונה לשלוחה)
+    # שלב א: כניסה ראשונה - מבקשים מהמשתמש לדבר
     if not user_text:
-        # פקודה למערכת הטלפונית: להשמיע הודעה ולפתוח מיקרופון לזיהוי דיבור
-        return "read=t-שלום, אני מקשיב, מה השאלה שלך?=&api_add_listening=yes"
+        # משתמשים ב-read כדי לפתוח מיקרופון (stt) ולשמור את התוצאה בפרמטר v
+        return "read=t-שלום, אני מקשיב, מה השאלה שלך?=v,stt,he-IL,no,yes"
 
-    # אם כבר יש טקסט מהמאזין, נשלח אותו ל-AI
+    # שלב ב: יש לנו טקסט מהמשתמש, שולחים ל-AI
     try:
         response = model.generate_content(user_text)
-        ai_text = response.text
-        # מחזירים את התשובה ופותחים שוב את המיקרופון לשאלה הבאה
-        return f"read=t-{ai_text}=&api_add_listening=yes"
+        ai_text = response.text.replace('"', '').replace("'", "").replace("=", "")
+        
+        # מחזירים את תשובת ה-AI ושוב פותחים מיקרופון לשאלה הבאה
+        return f"id_list_message=t-{ai_text}&read=t-האם יש עוד שאלה?=v,stt,he-IL,no,yes"
+        
     except Exception as e:
-        return "read=t-חלה שגיאה בעיבוד הנתונים, נסו שוב.=&api_add_listening=yes"
+        return "id_list_message=t-חלה שגיאה בחיבור למוח הדיגיטלי&read=t-נסה לומר שוב?=v,stt,he-IL,no,yes"
 
 @app.route('/')
 def home():
