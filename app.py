@@ -8,7 +8,7 @@ from urllib.parse import quote
 from flask import Flask, request
 from threading import Lock
 
-# הגדרת לוגים מתוקנת - ללא KeyError
+# לוגים בתקן ייצור
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -19,47 +19,62 @@ API_KEY = os.environ.get("GEMINI_KEY")
 YM_USER = os.environ.get("YM_USER")
 YM_PASS = os.environ.get("YM_PASS")
 
-# הגדרות ביצועים ו-Thread Safety
-TOTAL_BUDGET = 27.0  
+# הגדרות ניהול עומסים וכפילויות
+TOTAL_BUDGET = 27.0
+DUPLICATE_WINDOW = 2.0  # שניות לזיהוי כפילות של אותו קובץ
+SPAM_WINDOW = 5.0       # חלון זמן לבדיקת הצפה
+SPAM_LIMIT = 6          # מקסימום בקשות ל-IP בחלון הזמן
 LAST_CALLS = {}
 CACHE = {}
 data_lock = Lock()
 session = requests.Session()
-session.headers.update({"User-Agent": "AI-Telephony-Gateway/1.2"})
+session.headers.update({"User-Agent": "AI-Telephony-Gateway/1.3"})
 
 def normalize_text(text):
     if not text: return ""
-    # Whitelist מורחב התומך בפיסוק הקריינות של ימות המשיח
     cleaned = re.sub(r'[^א-תa-zA-Z0-9\s.,?!:\-()"]', '', text)
     return re.sub(r'\s+', ' ', cleaned)[:350].strip()
-
-def get_mime_type(path):
-    p = path.lower()
-    if p.endswith(".mp3"): return "audio/mpeg"
-    if p.endswith(".gsm"): return "audio/gsm"
-    if p.endswith(".amr"): return "audio/amr"
-    return "audio/wav"
 
 @app.route("/chat", methods=["GET", "POST"])
 def chat():
     start_time = time.time()
     ip = request.remote_addr
+    audio_path = request.values.get("audio_file", "")
     
-    # 1. Rate Limit & Cache Check (Thread Safe)
+    # 1. לוגיקת Rate Limit וכפילויות חכמה
     with data_lock:
         now = time.time()
-        if ip in LAST_CALLS and now - LAST_CALLS[ip] < 0.6:
-            return "id_list_message=t-נא להמתין בין בקשות&goto=.", 429
-        LAST_CALLS[ip] = now
         
-        # ניקוי זכרון תקופתי ל-Dicts
-        if len(LAST_CALLS) > 1000: LAST_CALLS.clear()
+        # יצירת מפתח ייחודי לשילוב של IP וקובץ
+        call_key = f"{ip}:{audio_path}"
+        
+        # ניקוי זכרון אם ה-Dict גדל מדי
+        if len(LAST_CALLS) > 5000: LAST_CALLS.clear()
         if len(CACHE) > 500: CACHE.clear()
+
+        # בדיקת כפילות (אותו קובץ נשלח שוב בזמן קצר)
+        if audio_path and call_key in LAST_CALLS:
+            if now - LAST_CALLS[call_key] < DUPLICATE_WINDOW:
+                logger.info(f"Duplicate request ignored: {audio_path}")
+                return "OK" # התעלמות שקטה למניעת שבירת השיחה
+
+        # ניהול היסטוריה ל-IP למניעת ספאם
+        if ip not in LAST_CALLS: LAST_CALLS[ip] = []
+        # השארת רק בקשות מה-5 שניות האחרונות (היסטוריית ה-IP נשמרת כרשימה)
+        if isinstance(LAST_CALLS[ip], list):
+            LAST_CALLS[ip] = [t for t in LAST_CALLS[ip] if now - t < SPAM_WINDOW]
+            if len(LAST_CALLS[ip]) >= SPAM_LIMIT:
+                logger.warning(f"Spam detected from IP: {ip}")
+                return "id_list_message=t-נא להמתין מספר שניות&goto=.", 429
+            LAST_CALLS[ip].append(now)
+        else:
+            LAST_CALLS[ip] = [now]
+
+        # עדכון זמן הבקשה האחרונה למפתח הספציפי
+        LAST_CALLS[call_key] = now
 
     try:
         if request.values.get("hangup") == "yes": return "OK"
-
-        audio_path = request.values.get("audio_file")
         if not audio_path:
             return "read=t-נא לומר שאלה לאחר הצליל=audio_file,yes,record,/,audio_file,no,yes,yes"
 
@@ -67,11 +82,10 @@ def chat():
         
         # בדיקת Cache
         if clean_path in CACHE:
-            logger.info(f"Cache Hit: {clean_path}")
             return CACHE[clean_path]
 
         if not all([API_KEY, YM_USER, YM_PASS]):
-            return "id_list_message=t-שגיאת הגדרות שרת&goto=."
+            return "id_list_message=t-שגיאת הגדרות מערכת&goto=."
 
         # 2. הורדת קובץ
         audio_url = f"https://call2all.co.il/ym/api/DownloadFile?isLogin=yes&username={quote(YM_USER)}&password={quote(YM_PASS)}&path={quote(clean_path)}"
@@ -82,60 +96,45 @@ def chat():
             try:
                 res = session.get(audio_url, timeout=10)
                 res.raise_for_status()
-                # בדיקת שתיקה (Silence Detection) בסיסית
+                # Silence Detection
                 if len(res.content) < 600 or res.content.count(b'\x00') / len(res.content) > 0.9:
-                    return "id_list_message=t-לא נשמע קול בהקלטה&goto=."
+                    return "id_list_message=t-לא נשמע קול בהקלטה, נסה שוב&goto=."
                 audio_content = res.content
                 break
-            except Exception as e:
-                logger.warning(f"Download Error: {e}")
+            except Exception:
                 time.sleep(0.5)
 
         if not audio_content:
             return "id_list_message=t-תקלה בהורדת השמע&goto=."
 
         # 3. AI Processing
-        mime_type = get_mime_type(clean_path)
         base64_audio = base64.b64encode(audio_content).decode("utf-8")
-        
-        if len(base64_audio) > 8_000_000: # הגנה על Payload
-            return "id_list_message=t-הקלטה ארוכה מדי&goto=."
-
         gemini_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+        
         payload = {
             "contents": [{"parts": [
-                {"text": "תמלל וענה בקצרה בעברית. אם אין דיבור, ענה: לא שמעתי."},
-                {"inline_data": {"mime_type": mime_type, "data": base64_audio}}
+                {"text": "תמלל וענה בקצרה בעברית. אם אין דיבור ברור, ענה: לא שמעתי."},
+                {"inline_data": {"mime_type": "audio/wav", "data": base64_audio}}
             ]}]
         }
 
         ai_text = None
         for attempt in range(2):
-            # בדיקת Budget לפני שליחה ל-AI
             elapsed = time.time() - start_time
             if elapsed > TOTAL_BUDGET - 6: break
-            
             try:
                 res_ai = session.post(gemini_url, json=payload, timeout=min(20, TOTAL_BUDGET - elapsed))
-                
                 if res_ai.status_code == 429:
-                    time.sleep(2)
+                    time.sleep(1.5)
                     continue
-                
                 res_ai.raise_for_status()
                 data = res_ai.json()
-                
-                # Safe Parsing
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts:
-                        ai_text = parts[0].get("text", "").strip()
-                        if ai_text: break
-                
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                if parts:
+                    ai_text = parts[0].get("text", "").strip()
+                    if ai_text: break
+            except Exception:
                 time.sleep(1)
-            except Exception as e:
-                logger.error(f"AI Attempt {attempt+1} Failed: {e}")
 
         # 4. Response & Cache
         if not ai_text or "לא שמעתי" in ai_text:
@@ -147,16 +146,11 @@ def chat():
         with data_lock:
             CACHE[clean_path] = response_string
             
-        logger.info(f"Success | {round(time.time()-start_time, 2)}s | Res: {final_response[:30]}...")
         return response_string
 
     except Exception as e:
-        logger.error(f"Critical Crash: {e}")
+        logger.error(f"Global Error: {e}")
         return "id_list_message=t-אירעה שגיאה, נסה שוב מאוחר יותר&goto=."
-
-@app.route("/")
-def health():
-    return "Gateway Active", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
