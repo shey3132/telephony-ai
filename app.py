@@ -1,16 +1,16 @@
-from flask import Flask, request
-import google.generativeai as genai
 import os
 import requests
+from flask import Flask, request
+import google.generativeai as genai
 
 app = Flask(__name__)
 
-# הגדרת ה-AI
-api_key = os.environ.get("GEMINI_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
-    # בתוך app.py, שנה את השורה של המודל לזו:
-model = genai.GenerativeModel('models/gemini-1.5-flash')
+# Configuration
+API_KEY = os.environ.get("GEMINI_KEY")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+    # Force use of gemini-1.5-flash which is more stable for audio
+    model = genai.GenerativeModel('gemini-1.5-flash')
 else:
     model = None
 
@@ -19,6 +19,7 @@ def chat():
     if request.values.get('hangup') == 'yes':
         return "OK"
 
+    # Get the audio path from the request
     audio_path = request.values.get('audio_file')
     
     if not audio_path:
@@ -28,45 +29,42 @@ def chat():
         ym_user = os.environ.get("YM_USER")
         ym_pass = os.environ.get("YM_PASS")
         
-        # ניקוי נתיב (לפעמים מגיע כרשימה, לוקחים את האחרון)
+        # Handle cases where audio_file might be a list
         if isinstance(audio_path, list):
             audio_path = audio_path[-1]
+        
         clean_path = audio_path.lstrip('/')
         
-        # הורדת הקובץ
+        # Build download URL
         audio_url = f"https://call2all.co.il/ym/api/DownloadFile?isLogin=yes&username={ym_user}&password={ym_pass}&path={clean_path}"
-        audio_res = requests.get(audio_url)
         
-        if audio_res.status_code != 200:
-            return f"id_list_message=t-שגיאה בהורדת הקובץ&read=t-נסה שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        response_audio = requests.get(audio_url)
+        if response_audio.status_code != 200:
+            return f"id_list_message=t-שגיאה בהורדת הקובץ {response_audio.status_code}&read=t-נסו שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
-        # שליחה ל-AI בפורמט בטוח יותר
-        audio_data = audio_res.content
+        # Prepare for Gemini
+        audio_data = {
+            "mime_type": "audio/wav",
+            "data": response_audio.content
+        }
         
-        # יצירת התוכן לשליחה
-        contents = [
-            {
-                "mime_type": "audio/wav",
-                "data": audio_data
-            },
-            "תמלל את ההקלטה וענה עליה בקצרה בעברית. אם ההקלטה ריקה או שאין בה דיבור ברור, תענה שלא שמעת כלום."
-        ]
+        prompt = "Analyze this audio. If it contains a question, answer it concisely in Hebrew. If it is silent or unclear, say you didn't hear anything."
         
-        response = model.generate_content(contents)
+        ai_response = model.generate_content([prompt, audio_data])
         
-        # ניקוי התשובה
-        ai_text = response.text.replace('"', '').replace("=", "").replace("&", " ו- ").replace("\n", " ")
+        # Clean the output text
+        final_text = ai_response.text.replace('"', '').replace('=', '').replace('&', ' ו- ').replace('\n', ' ')
         
-        return f"id_list_message=t-{ai_text}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        return f"id_list_message=t-{final_text}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
     except Exception as e:
-        # הדפסת השגיאה המדויקת ללוגים של Render כדי שנדע מה קרה
         print(f"DEBUG ERROR: {str(e)}")
-        return f"id_list_message=t-הבינה המלאכותית לא הצליחה לעבד את הקול.&read=t-נסה לומר שוב בקצרה?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        return f"id_list_message=t-חלה שגיאה בבינה המלאכותית&read=t-נסו לומר שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
 @app.route('/')
 def home():
-    return "The AI Server is Running!"
+    return "Server is live"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
