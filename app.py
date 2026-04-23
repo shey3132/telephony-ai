@@ -23,9 +23,12 @@ def chat():
         return "read=t-נא לומר את השאלה לאחר הצליל ולסיום להקיש סולמית=audio_file,yes,record,/,audio_file,no,yes,yes"
 
     try:
-        # 1. הורדת קובץ השמע מהמערכת הטלפונית
-        # (הכתובת המלאה נבנית מהנתיב שהתקבל)
-        audio_url = f"https://call2all.co.il/ym/api/DownloadFile?path={audio_path}"
+        # שליפת פרטי התחברות מהגדרות השרת
+        ym_user = os.environ.get("YM_USER")
+        ym_pass = os.environ.get("YM_PASS")
+        
+        # בניית הקישור עם שם המשתמש והסיסמה שלך
+        audio_url = f"https://call2all.co.il/ym/api/DownloadFile?token={ym_user}:{ym_pass}&path={audio_path}"
         audio_data = requests.get(audio_url).content
         
         # 2. שליחת הקובץ ל-Gemini לתמלול ומענה
