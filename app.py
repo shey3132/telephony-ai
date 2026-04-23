@@ -1,181 +1,144 @@
-import os
-import base64
-import requests
-import logging
-import time
-import re
+import os, base64, requests, logging, time, re, redis
 from urllib.parse import quote
 from flask import Flask, request
 
 app = Flask(__name__)
 
 # ======================
-# CONFIG
+# CONFIG & INFRA
 # ======================
 API_KEY = os.environ.get("GEMINI_KEY")
 YM_USER = os.environ.get("YM_USER")
 YM_PASS = os.environ.get("YM_PASS")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
+r = redis.from_url(REDIS_URL, decode_responses=True)
 session = requests.Session()
-session.headers.update({"User-Agent": "AI-Telephony-Gateway/2.0"})
+session.headers.update({"User-Agent": "Enterprise-IVR/4.0"})
 
-# מניעת כפילויות (בזיכרון זמני) - מומלץ לנקות מדי פעם בייצור
-PROCESSED_CALLS = set()
-
-# ======================
-# LOGGING
-# ======================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | [%(call_id)s] | %(levelname)s | %(message)s")
+logger = logging.getLogger("IVR_PRO")
 
 # ======================
-# HELPERS
+# LUA SCRIPTS (Atomic Operations)
 # ======================
-def normalize_hebrew_text(text):
-    """ ניקוי תווים מיוחדים שעלולים לשבש את המערכת הטלפונית """
+# סקריפט שבודק קאש ואם אין - נועל אטומית בפעולה אחת
+LUA_LOCK_AND_CHECK = """
+local cached = redis.call('get', KEYS[2])
+if cached then return {1, cached} end
+local lock = redis.call('set', KEYS[1], 'processing', 'NX', 'EX', ARGV[1])
+if lock then return {0, 'ok'} else return {2, 'locked'} end
+"""
+
+# ======================
+# ROBUST HELPERS
+# ======================
+def get_atomic_status(audio_path, ttl=45):
+    """ משתמש ב-Lua כדי למנוע Race Condition בין ה-Lock ל-Cache """
+    lock_key = f"lock:{audio_path}"
+    cache_key = f"resp:{audio_path}"
+    # returns: [status, value] -> 0: New lock, 1: Cached, 2: Busy
+    return r.eval(LUA_LOCK_AND_CHECK, 2, lock_key, cache_key, ttl)
+
+def get_stable_content(url):
+    """ אימות קובץ מבוסס תוכן (Actual Byte Check) ללא הסתמכות על Headers """
+    last_content_len = -1
+    for i in range(4):
+        try:
+            res = session.get(url, timeout=7)
+            if res.status_code == 200:
+                curr_len = len(res.content)
+                if curr_len > 600 and curr_len == last_content_len:
+                    return res.content
+                last_content_len = curr_len
+            time.sleep(0.7 + (i * 0.3)) # Exponential jitter
+        except Exception as e:
+            logger.warning(f"Download check failed: {e}")
+    return None
+
+def clean_tts(text):
     if not text: return ""
-    # השארת אותיות, מספרים ופיסוק בסיסי בלבד
-    cleaned = re.sub(r'[^א-תa-zA-Z0-9\s.,?!:\-()"]', '', text)
-    return re.sub(r'\s+', ' ', cleaned).strip()
-
-def get_mime_type(path):
-    p = path.lower()
-    if p.endswith(".mp3"): return "audio/mpeg"
-    if p.endswith(".wav"): return "audio/wav"
-    if p.endswith(".gsm"): return "audio/gsm"
-    if p.endswith(".amr"): return "audio/amr"
-    return "audio/wav"
-
-def safe_extract_ai(data):
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception:
-        return None
+    return re.sub(r'[*#_`-]', '', text).replace("\n", " ").strip()[:350]
 
 # ======================
-# MAIN ROUTE
+# MAIN ENGINE
 # ======================
 @app.route("/chat", methods=["GET", "POST"])
 def chat():
-    start_time = time.time()
-    
+    call_id = request.values.get("ApiCallId", "unknown")
+    audio_path = request.values.get("audio_file")
+    extra = {'call_id': call_id}
+
     try:
-        # ----------------------
-        # 1. HANGUP HANDLING (תיקון קריטי!)
-        # ----------------------
-        # אם המשתמש ניתק או שהמערכת שולחת סיום - אנחנו חייבים לסגור נקי
+        # 1. HANGUP & INITIAL
         if request.values.get("hangup") == "yes":
-            logger.info("Hangup received - closing session")
-            return "hangup=yes" # פקודה לימות המשיח לסגור את השיחה סופית
-
-        # ----------------------
-        # 2. Dedup calls
-        # ----------------------
-        call_id = request.values.get("ApiCallId")
-        if call_id:
-            if call_id in PROCESSED_CALLS:
-                return "OK"
-            PROCESSED_CALLS.add(call_id)
-            # ניקוי זכרון פשוט
-            if len(PROCESSED_CALLS) > 1000: PROCESSED_CALLS.clear()
-
-        # ----------------------
-        # 3. Input validation
-        # ----------------------
-        audio_path = request.values.get("audio_file")
+            return "hangup=yes"
+        
         if not audio_path:
-            return "read=t-נא דבר לאחר הצליל=audio_file,yes,record,/,audio_file,no,yes,yes"
+            return "read=t-שלום, נא לומר את שאלתכם לאחר הצליל=audio_file,yes,record,/,audio_file,no,yes,yes"
 
-        if not all([API_KEY, YM_USER, YM_PASS]):
-            return "id_list_message=t-שגיאת קונפיגורציה&goto=."
+        # 2. ATOMIC LOCK & IDEMPOTENCY (Lua Layer)
+        # מפתח ייחודי שמשלב מסלול ו-ID כדי למנוע זליגת קאש בין שיחות
+        unique_key = f"{call_id}:{audio_path.lstrip('/')}"
+        status, value = get_atomic_status(unique_key)
 
-        clean_path = audio_path.lstrip("/")
-        mime_type = get_mime_type(clean_path)
+        if status == 1: # Cached
+            logger.info("Returning atomic cached response", extra=extra)
+            return value
+        if status == 2: # Busy
+            return "OK" # ימות המשיח ינסו שוב או יחכו
 
-        # WAIT לסנכרון הקובץ בשרת
-        time.sleep(0.8)
-
-        audio_url = (
-            "https://call2all.co.il/ym/api/DownloadFile"
-            f"?isLogin=yes&username={quote(YM_USER)}"
-            f"&password={quote(YM_PASS)}&path={quote(clean_path)}"
-        )
-
-        # ----------------------
-        # 4. DOWNLOAD WITH SIZE CHECK
-        # ----------------------
-        audio_content = None
-        for attempt in range(3):
-            try:
-                res = session.get(audio_url, timeout=12)
-                if res.status_code == 200:
-                    size = len(res.content)
-                    if size < 400:
-                        logger.warning(f"File too small: {size} bytes")
-                        return "read=t-לא שמעתי, נסה שוב=audio_file,yes,record,/,audio_file,no,yes,yes"
-                    audio_content = res.content
-                    break
-                time.sleep(1)
-            except Exception as e:
-                logger.warning(f"Download attempt {attempt+1} failed: {e}")
-
+        # 3. STABLE DOWNLOAD (Content-based)
+        audio_url = (f"https://call2all.co.il/ym/api/DownloadFile?isLogin=yes"
+                     f"&username={quote(YM_USER)}&password={quote(YM_PASS)}&path={quote(audio_path.lstrip('/'))}")
+        
+        audio_content = get_stable_content(audio_url)
         if not audio_content:
-            return "id_list_message=t-שגיאה בקליטת השמע&goto=."
+            r.delete(f"lock:{unique_key}")
+            return "read=t-לא שמעתי אתכם טוב, נסו שנית=audio_file,yes,record,/,audio_file,no,yes,yes"
 
-        # ----------------------
-        # 5. GEMINI REQUEST
-        # ----------------------
-        base64_audio = base64.b64encode(audio_content).decode()
+        # 4. AI CIRCUIT BREAKER LAYER
+        b64 = base64.b64encode(audio_content).decode()
         gemini_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}"
-
+        
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": "תמלל וענה בקצרה מאוד בעברית. אם אין דיבור, ענה רק 'לא שמעתי'."},
-                    {"inline_data": {"mime_type": mime_type, "data": base64_audio}}
-                ]
-            }]
+            "contents": [{"parts": [
+                {"text": "system: ענה בעברית קצרה. אם אין דיבור ברור, ענה: [SILENCE]"},
+                {"inline_data": {"mime_type": "audio/wav", "data": b64}}
+            ]}]
         }
 
         ai_text = None
-        for attempt in range(2):
-            try:
-                res = session.post(gemini_url, json=payload, timeout=22)
-                res.raise_for_status()
-                ai_text = safe_extract_ai(res.json())
-                if ai_text: break
-            except Exception as e:
-                logger.warning(f"Gemini attempt {attempt+1} failed: {e}")
-                time.sleep(1)
+        try:
+            ai_res = session.post(gemini_url, json=payload, timeout=18)
+            ai_data = ai_res.json()
+            
+            # Explicit Error Handling
+            if "error" in ai_data:
+                logger.error(f"Gemini API Error: {ai_data['error']}", extra=extra)
+            else:
+                parts = ai_data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                if parts:
+                    ai_text = parts[0].get("text", "").strip()
+        except Exception as e:
+            logger.error(f"AI Connection Failed: {e}", extra=extra)
 
-        # ----------------------
-        # 6. RESPONSE HANDLING
-        # ----------------------
-        if not ai_text or "לא שמעתי" in ai_text:
-            return "read=t-מצטער, לא שמעתי טוב. נסה שוב=audio_file,yes,record,/,audio_file,no,yes,yes"
+        # 5. UX & FINAL RESPONSE
+        if not ai_text or "[SILENCE]" in ai_text:
+            response = "read=t-מצטער, לא שמעתי. אפשר לומר שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        else:
+            final_txt = clean_tts(ai_text)
+            response = f"id_list_message=t-{final_txt}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
-        # ניקוי ונירמול התשובה (קריטי להקראה נקייה)
-        clean_response = normalize_hebrew_text(ai_text)[:350]
-
-        # בדיקת Timeout לפני שליחה
-        if time.time() - start_time > 26:
-             return "id_list_message=t-התהליך לקח זמן רב מדי, נסה שנית&goto=."
-
-        logger.info(f"AI SUCCESS | {clean_response[:50]}...")
-
-        # החזרת תשובה והמשך הקלטה
-        return (
-            f"id_list_message=t-{clean_response}"
-            "&read=t-האם יש לך עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
-        )
+        # 6. ATOMIC SAVE & LOCK RELEASE
+        r.set(f"resp:{unique_key}", response, ex=600)
+        logger.info("Process completed successfully", extra=extra)
+        return response
 
     except Exception as e:
-        logger.error(f"GLOBAL ERROR: {e}")
-        return "id_list_message=t-אירעה שגיאה כללית&goto=."
+        logger.error(f"Global Crash: {e}", extra=extra)
+        if 'unique_key' in locals(): r.delete(f"lock:{unique_key}")
+        return "id_list_message=t-תקלה במערכת, נסו שוב מאוחר יותר&goto=."
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
