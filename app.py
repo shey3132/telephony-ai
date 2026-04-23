@@ -1,65 +1,82 @@
 import os
 import requests
+import base64
 from flask import Flask, request
-import google.generativeai as genai
 
 app = Flask(__name__)
-
 API_KEY = os.environ.get("GEMINI_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
-    # שימוש במודל הישן והיציב, שנתמך בכל גרסאות הספריה
-    model = genai.GenerativeModel('gemini-pro-vision')
-else:
-    model = None
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
+    # 1. התעלמות מניתוקים
     if request.values.get('hangup') == 'yes':
         return "OK"
 
-    audio_path = request.values.get('audio_file')
+    # טיפול בפרמטר כפול שימות המשיח לפעמים שולחת
+    audio_paths = request.values.getlist('audio_file')
     
-    if not audio_path:
+    # 2. אין קובץ? מבקשים מהמאזין לדבר
+    if not audio_paths or audio_paths[0] == "":
         return "read=t-נא לומר את השאלה לאחר הצליל ולסיום להקיש סולמית=audio_file,yes,record,/,audio_file,no,yes,yes"
 
     try:
+        # לוקחים את הנתיב האחרון ברשימה ומנקים אותו
+        clean_path = audio_paths[-1].lstrip('/')
+        
         ym_user = os.environ.get("YM_USER")
         ym_pass = os.environ.get("YM_PASS")
         
-        if isinstance(audio_path, list):
-            audio_path = audio_path[-1]
-        clean_path = audio_path.lstrip('/')
-        
+        # 3. מורידים את הקובץ מהמערכת שלך
         audio_url = f"https://call2all.co.il/ym/api/DownloadFile?isLogin=yes&username={ym_user}&password={ym_pass}&path={clean_path}"
         response_audio = requests.get(audio_url)
         
         if response_audio.status_code != 200:
-            return f"id_list_message=t-שגיאה בהורדת הקובץ {response_audio.status_code}&read=t-נסו שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
+            return f"id_list_message=t-תקלה בהורדת הקובץ מהמערכת&read=t-נסו שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
-        audio_data = {
-            "mime_type": "audio/wav",
-            "data": response_audio.content
+        # 4. הופכים את הקול לטקסט מקודד כדי לשלוח לגוגל ישירות
+        base64_audio = base64.b64encode(response_audio.content).decode('utf-8')
+        
+        # הכתובת הישירה והמדויקת של גוגל (עוקף את כל ספריות הפייתון)
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": "Analyze this audio. Answer concisely in Hebrew. If it's silent or unclear, say you didn't hear anything."},
+                    {"inline_data": {
+                        "mime_type": "audio/wav",
+                        "data": base64_audio
+                    }}
+                ]
+            }]
         }
         
-        prompt = "Analyze this audio. Answer concisely in Hebrew. If silent, say you didn't hear."
+        headers = {'Content-Type': 'application/json'}
         
-        # שימוש בפורמט הישן של פנייה למודל
-        ai_response = model.generate_content([prompt, audio_data])
+        # 5. שליחה לגוגל
+        gemini_response = requests.post(gemini_url, json=payload, headers=headers)
+        gemini_data = gemini_response.json()
         
-        final_text = ai_response.text.replace('"', '').replace('=', '').replace('&', ' ו- ').replace('\n', ' ')
+        # 6. בדיקה אם גוגל החזירו שגיאה
+        if 'error' in gemini_data:
+            print(f"GEMINI ERROR: {gemini_data['error']}")
+            return f"id_list_message=t-מפתח הבינה המלאכותית שגוי או חסום&read=t-נסו לומר שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
+            
+        # 7. חילוץ התשובה מתוך ה-JSON של גוגל
+        final_text = gemini_data['candidates'][0]['content']['parts'][0]['text']
+        
+        # ניקוי תווים בעייתיים למערכת ימות המשיח
+        final_text = final_text.replace('"', '').replace('=', '').replace('&', ' ו- ').replace('\n', ' ')
         
         return f"id_list_message=t-{final_text}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
     except Exception as e:
-        print(f"DEBUG ERROR: {str(e)}")
-        # אם יש שגיאה, המערכת תגיד לנו בדיוק מהי ולא סתם "חלה שגיאה"
-        safe_error = str(e).replace('"', '').replace('=', '')[:100]
-        return f"id_list_message=t-שגיאה בחיבור {safe_error}&read=t-נסו לומר שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        print(f"CRITICAL ERROR: {str(e)}")
+        return f"id_list_message=t-תקלה פנימית בשרת&read=t-נסו לומר שוב?=audio_file,yes,record,/,audio_file,no,yes,yes"
 
 @app.route('/')
 def home():
-    return "Server is live"
+    return "The Direct REST API Server is LIVE!"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
