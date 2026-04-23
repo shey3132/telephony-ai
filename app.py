@@ -8,7 +8,6 @@ from urllib.parse import quote
 from flask import Flask, request
 from threading import Lock
 
-# לוגים בסיסיים ויציבים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -19,14 +18,15 @@ API_KEY = os.environ.get("GEMINI_KEY")
 YM_USER = os.environ.get("YM_USER")
 YM_PASS = os.environ.get("YM_PASS")
 
-# ניהול תקציב זמן וכפילויות
+# הגדרות ניהול שיחה
+RECORD_COMMAND = "read=t-{}={}"  # תבנית פקודה להקלטה מחדש
+RECORD_PARAMS = "audio_file,yes,record,/,audio_file,no,yes,yes"
+
 LAST_CALLS = {}
-CACHE = {}
 data_lock = Lock()
 session = requests.Session()
 
 def normalize_text(text):
-    """ ניקוי טקסט בסיסי להקראה טלפונית """
     if not text: return ""
     cleaned = re.sub(r'[^א-תa-zA-Z0-9\s.,?!:\-()"]', '', text)
     return re.sub(r'\s+', ' ', cleaned)[:350].strip()
@@ -37,41 +37,47 @@ def chat():
     ip = request.remote_addr
     audio_path = request.values.get("audio_file", "")
     
-    # 1. מניעת כפילויות (Duplicate Request Guard)
+    # 1. מניעת כפילויות
     with data_lock:
         now = time.time()
         call_key = f"{ip}:{audio_path}"
         if audio_path and call_key in LAST_CALLS:
-            if now - LAST_CALLS[call_key] < 2.0:
+            if now - LAST_CALLS[call_key] < 3.0:
                 return "OK"
         LAST_CALLS[call_key] = now
         if len(LAST_CALLS) > 1000: LAST_CALLS.clear()
 
     try:
         if request.values.get("hangup") == "yes": return "OK"
+        
+        # הודעת פתיחה ראשונית
         if not audio_path:
-            return "read=t-נא לומר את השאלה לאחר הצליל=audio_file,yes,record,/,audio_file,no,yes,yes"
+            return RECORD_COMMAND.format("נא לומר את שאלה לאחר הצליל", RECORD_PARAMS)
 
         clean_path = audio_path.lstrip("/")
+        audio_url = f"https://call2all.co.il/ym/api/DownloadFile" \
+                    f"?isLogin=yes&username={quote(YM_USER)}&password={quote(YM_PASS)}&path={quote(clean_path)}"
         
-        # 2. הורדת הקובץ עם בדיקת סף מינימלית
-        audio_url = f"https://call2all.co.il/ym/api/DownloadFile?isLogin=yes&username={quote(YM_USER)}&password={quote(YM_PASS)}&path={quote(clean_path)}"
-        
-        try:
-            res = session.get(audio_url, timeout=10)
-            res.raise_for_status()
-            
-            # אם הקובץ קטן מ-300 בתים, זה Header ריק - אין טעם להמשיך ל-AI
-            if len(res.content) < 300:
-                logger.warning(f"Empty/Failed record: {len(res.content)} bytes")
-                return "id_list_message=t-לא התקבלה הקלטה, נסה שוב&goto=."
-                
-            audio_content = res.content
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            return "id_list_message=t-שגיאה זמנית בתקשורת&goto=."
+        # 2. הורדה עם המתנה לסנכרון הקובץ
+        audio_content = None
+        for attempt in range(3):
+            try:
+                res = session.get(audio_url, timeout=10)
+                res.raise_for_status()
+                if len(res.content) < 800:
+                    time.sleep(1.5)
+                    continue
+                audio_content = res.content
+                break
+            except:
+                time.sleep(1)
 
-        # 3. עיבוד AI פשוט
+        # שגיאה: קובץ לא תקין - מחזירים להקלטה מחדש במקום לצאת
+        if not audio_content:
+            logger.warning("File missing or too small after retries")
+            return RECORD_COMMAND.format("סליחה, ההקלטה לא נקלטה. אפשר לנסות שוב?", RECORD_PARAMS)
+
+        # 3. עיבוד AI
         base64_audio = base64.b64encode(audio_content).decode("utf-8")
         gemini_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}"
         
@@ -93,16 +99,19 @@ def chat():
         except Exception as e:
             logger.error(f"AI error: {e}")
 
-        # 4. תגובה סופית
+        # שגיאה: ה-AI לא הבין או שקט - מחזירים להקלטה מחדש
         if not ai_text or "לא שמעתי" in ai_text:
-            return "id_list_message=t-לא הצלחתי להבין, נסה שנית&goto=."
+            return RECORD_COMMAND.format("לא הצלחתי לשמוע את דבריך, ננסה שוב?", RECORD_PARAMS)
 
+        # 4. הצלחה - החזרת התשובה והצעה לשאלה נוספת (שוב עם read)
         final_response = normalize_text(ai_text)
-        return f"id_list_message=t-{final_response}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        logger.info(f"Success! Response: {final_response[:30]}")
+        
+        return RECORD_COMMAND.format(f"{final_response}. האם יש לך עוד שאלה?", RECORD_PARAMS)
 
     except Exception as e:
-        logger.error(f"System error: {e}")
-        return "id_list_message=t-אירעה שגיאה, נסו שוב&goto=."
+        logger.error(f"Global Crash: {e}")
+        return RECORD_COMMAND.format("אירעה שגיאה קלה, אפשר לנסות שוב?", RECORD_PARAMS)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
