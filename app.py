@@ -28,39 +28,42 @@ def chat():
         return "read=t-נא לומר את השאלה לאחר הצליל ולסיום להקיש סולמית=audio_file,yes,record,/,audio_file,no,yes,yes"
 
     # שלב ב: עיבוד קובץ השמע
-    try:
+try:
         ym_user = os.environ.get("YM_USER")
         ym_pass = os.environ.get("YM_PASS")
         
-        # בניית כתובת ההורדה עם פרטי הגישה שלך
-        audio_url = f"https://call2all.co.il/ym/api/DownloadFile?token={ym_user}:{ym_pass}&path={audio_path}"
+        # ניקוי הנתיב למקרה שיש סלאשים מיותרים
+        clean_path = audio_path.lstrip('/')
         
-        # הורדת הקובץ מהשרת של ימות המשיח
+        # בניית ה-URL לפי הפורמט המדויק של API ימות המשיח
+        # שים לב: השתמשנו ב-password במקום token ליתר ביטחון
+        audio_url = f"https://call2all.co.il/ym/api/DownloadFile?isLogin=yes&username={ym_user}&password={ym_pass}&path={clean_path}"
+        
+        print(f"Attempting to download from: {audio_url}") # זה יופיע בלוגים שלך
+        
         audio_res = requests.get(audio_url)
+        
+        # אם זה עדיין נכשל, ננסה פורמט נוסף של כתובת
         if audio_res.status_code != 200:
-            return f"id_list_message=t-שגיאה בהורדת הקובץ. קוד שגיאה {audio_res.status_code}&go_to_folder=."
+             audio_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={ym_user}:{ym_pass}&path={clean_path}"
+             audio_res = requests.get(audio_url)
+
+        if audio_res.status_code != 200:
+            return f"id_list_message=t-שגיאה בהורדת הקובץ. קוד {audio_res.status_code}&go_to_folder=."
 
         audio_data = audio_res.content
         
-        # הכנת הקובץ לשליחה לבינה המלאכותית
+        # המשך הקוד (שליחה ל-AI)...
         audio_part = {
             "mime_type": "audio/wav",
             "data": audio_data
         }
         
-        # שליחה ל-AI עם הנחיה ברורה
-        prompt = "תמלל את ההקלטה וענה עליה בקצרה ובעברית. אם אין דיבור בהקלטה, תגיד שלא שמעת כלום."
+        prompt = "תמלל את ההקלטה וענה עליה בקצרה ובעברית."
         response = model.generate_content([prompt, audio_part])
-        
-        # ניקוי התשובה מתווים שעלולים לשבש את המערכת הטלפונית
         ai_text = response.text.replace('"', '').replace("=", "").replace("&", " ו- ").replace("\n", " ")
         
-        # החזרת התשובה למאזין ופתיחת הקלטה נוספת
         return f"id_list_message=t-{ai_text}&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
-
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return f"id_list_message=t-חלה שגיאה בעיבוד הנתונים. {str(e)[:50]}&go_to_folder=."
 
 @app.route('/')
 def home():
