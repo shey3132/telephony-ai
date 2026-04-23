@@ -2,116 +2,210 @@ import os
 import base64
 import requests
 import logging
-import re
 import time
 from urllib.parse import quote
 from flask import Flask, request
-from threading import Lock
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# קונפיגורציה
+# ======================
+# CONFIG
+# ======================
 API_KEY = os.environ.get("GEMINI_KEY")
 YM_USER = os.environ.get("YM_USER")
 YM_PASS = os.environ.get("YM_PASS")
 
-# הגדרות ניהול שיחה
-RECORD_COMMAND = "read=t-{}={}"  # תבנית פקודה להקלטה מחדש
-RECORD_PARAMS = "audio_file,yes,record,/,audio_file,no,yes,yes"
-
-LAST_CALLS = {}
-data_lock = Lock()
 session = requests.Session()
+session.headers.update({"User-Agent": "AI-Telephony-Gateway/2.0"})
 
-def normalize_text(text):
-    if not text: return ""
-    cleaned = re.sub(r'[^א-תa-zA-Z0-9\s.,?!:\-()"]', '', text)
-    return re.sub(r'\s+', ' ', cleaned)[:350].strip()
+# מניעת כפילויות (בזיכרון זמני)
+PROCESSED_CALLS = set()
 
+# ======================
+# LOGGING
+# ======================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# ======================
+# HELPERS
+# ======================
+def get_mime_type(path):
+    p = path.lower()
+    if p.endswith(".mp3"):
+        return "audio/mpeg"
+    if p.endswith(".wav"):
+        return "audio/wav"
+    if p.endswith(".gsm"):
+        return "audio/gsm"
+    if p.endswith(".amr"):
+        return "audio/amr"
+    return "audio/wav"
+
+
+def safe_extract_ai(data):
+    """ חילוץ בטוח של תשובת Gemini """
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return None
+
+
+# ======================
+# MAIN ROUTE
+# ======================
 @app.route("/chat", methods=["GET", "POST"])
 def chat():
     start_time = time.time()
-    ip = request.remote_addr
-    audio_path = request.values.get("audio_file", "")
-    
-    # 1. מניעת כפילויות
-    with data_lock:
-        now = time.time()
-        call_key = f"{ip}:{audio_path}"
-        if audio_path and call_key in LAST_CALLS:
-            if now - LAST_CALLS[call_key] < 3.0:
-                return "OK"
-        LAST_CALLS[call_key] = now
-        if len(LAST_CALLS) > 1000: LAST_CALLS.clear()
 
     try:
-        if request.values.get("hangup") == "yes": return "OK"
-        
-        # הודעת פתיחה ראשונית
+        # ----------------------
+        # Hangup
+        # ----------------------
+        if request.values.get("hangup") == "yes":
+            return "OK"
+
+        # ----------------------
+        # Dedup calls
+        # ----------------------
+        call_id = request.values.get("ApiCallId")
+        if call_id:
+            if call_id in PROCESSED_CALLS:
+                return "OK"
+            PROCESSED_CALLS.add(call_id)
+
+        # ----------------------
+        # Input validation
+        # ----------------------
+        audio_path = request.values.get("audio_file")
         if not audio_path:
-            return RECORD_COMMAND.format("נא לומר את שאלה לאחר הצליל", RECORD_PARAMS)
+            return "read=t-אנא דבר לאחר הצליל=audio_file,yes,record,/,audio_file,no,yes,yes"
+
+        if not all([API_KEY, YM_USER, YM_PASS]):
+            return "id_list_message=t-שגיאת קונפיגורציה&goto=."
 
         clean_path = audio_path.lstrip("/")
-        audio_url = f"https://call2all.co.il/ym/api/DownloadFile" \
-                    f"?isLogin=yes&username={quote(YM_USER)}&password={quote(YM_PASS)}&path={quote(clean_path)}"
-        
-        # 2. הורדה עם המתנה לסנכרון הקובץ
+        mime_type = get_mime_type(clean_path)
+
+        # ======================
+        # 1. WAIT (קריטי!)
+        # ======================
+        time.sleep(0.8)
+
+        audio_url = (
+            "https://call2all.co.il/ym/api/DownloadFile"
+            f"?isLogin=yes&username={quote(YM_USER)}"
+            f"&password={quote(YM_PASS)}&path={quote(clean_path)}"
+        )
+
+        # ======================
+        # 2. DOWNLOAD RETRY
+        # ======================
         audio_content = None
+
         for attempt in range(3):
             try:
-                res = session.get(audio_url, timeout=10)
-                res.raise_for_status()
-                if len(res.content) < 800:
-                    time.sleep(1.5)
-                    continue
-                audio_content = res.content
-                break
-            except:
+                res = session.get(audio_url, timeout=12)
+
+                if res.status_code == 200:
+                    size = len(res.content)
+
+                    if size < 400:
+                        logger.warning(f"Too small file: {size} bytes")
+                        return "read=t-לא נשמע קול, נסה שוב=audio_file,yes,record,/,audio_file,no,yes,yes"
+
+                    audio_content = res.content
+                    break
+
+            except Exception as e:
+                logger.warning(f"Download attempt {attempt+1} failed: {e}")
                 time.sleep(1)
 
-        # שגיאה: קובץ לא תקין - מחזירים להקלטה מחדש במקום לצאת
         if not audio_content:
-            logger.warning("File missing or too small after retries")
-            return RECORD_COMMAND.format("סליחה, ההקלטה לא נקלטה. אפשר לנסות שוב?", RECORD_PARAMS)
+            return "id_list_message=t-שגיאת הורדת קובץ&goto=."
 
-        # 3. עיבוד AI
-        base64_audio = base64.b64encode(audio_content).decode("utf-8")
-        gemini_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}"
-        
+        # ======================
+        # 3. GEMINI REQUEST
+        # ======================
+        base64_audio = base64.b64encode(audio_content).decode()
+
+        gemini_url = (
+            "https://generativelanguage.googleapis.com/v1/models/"
+            f"gemini-1.5-flash:generateContent?key={API_KEY}"
+        )
+
         payload = {
-            "contents": [{"parts": [
-                {"text": "ענה בקצרה בעברית על השאלה בשמע. אם אין דיבור ברור, ענה רק: לא שמעתי."},
-                {"inline_data": {"mime_type": "audio/wav", "data": base64_audio}}
-            ]}]
+            "contents": [{
+                "parts": [
+                    {"text": "תמלל וענה בקצרה בעברית."},
+                    {"inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64_audio
+                    }}
+                ]
+            }]
         }
 
-        ai_text = ""
-        try:
-            res_ai = session.post(gemini_url, json=payload, timeout=15)
-            res_ai.raise_for_status()
-            data = res_ai.json()
-            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            if parts:
-                ai_text = parts[0].get("text", "").strip()
-        except Exception as e:
-            logger.error(f"AI error: {e}")
+        ai_text = None
 
-        # שגיאה: ה-AI לא הבין או שקט - מחזירים להקלטה מחדש
-        if not ai_text or "לא שמעתי" in ai_text:
-            return RECORD_COMMAND.format("לא הצלחתי לשמוע את דבריך, ננסה שוב?", RECORD_PARAMS)
+        for attempt in range(2):
+            try:
+                res = session.post(gemini_url, json=payload, timeout=25)
+                res.raise_for_status()
 
-        # 4. הצלחה - החזרת התשובה והצעה לשאלה נוספת (שוב עם read)
-        final_response = normalize_text(ai_text)
-        logger.info(f"Success! Response: {final_response[:30]}")
-        
-        return RECORD_COMMAND.format(f"{final_response}. האם יש לך עוד שאלה?", RECORD_PARAMS)
+                data = res.json()
+                ai_text = safe_extract_ai(data)
+
+                if ai_text:
+                    break
+
+            except Exception as e:
+                logger.warning(f"Gemini attempt {attempt+1} failed: {e}")
+                time.sleep(1)
+
+        # ======================
+        # 4. RESPONSE HANDLING
+        # ======================
+        if not ai_text:
+            return "id_list_message=t-המערכת עמוסה, נסה שוב&goto=."
+
+        if "לא שמעתי" in ai_text:
+            return "read=t-לא שמעתי, נסה שוב=audio_file,yes,record,/,audio_file,no,yes,yes"
+
+        # ניקוי בסיסי
+        ai_text = ai_text.replace("\n", " ").strip()[:300]
+
+        # timeout safety
+        if time.time() - start_time > 25:
+            return "id_list_message=t-הבקשה ארוכה מדי, נסה שוב&goto=."
+
+        logger.info(f"OK | {ai_text}")
+
+        return (
+            f"id_list_message=t-{ai_text}"
+            "&read=t-האם יש עוד שאלה?=audio_file,yes,record,/,audio_file,no,yes,yes"
+        )
 
     except Exception as e:
-        logger.error(f"Global Crash: {e}")
-        return RECORD_COMMAND.format("אירעה שגיאה קלה, אפשר לנסות שוב?", RECORD_PARAMS)
+        logger.error(f"GLOBAL ERROR: {e}")
+        return "id_list_message=t-שגיאה כללית&goto=."
 
+
+# ======================
+# HEALTH CHECK
+# ======================
+@app.route("/")
+def home():
+    return "OK - AI Telephony Server Running", 200
+
+
+# ======================
+# RUN
+# ======================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
